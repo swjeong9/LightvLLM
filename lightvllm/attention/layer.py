@@ -1,0 +1,1 @@
+"""Attention layer implementation."""

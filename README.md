@@ -1,0 +1,59 @@
+# LightvLLM
+
+vLLM을 기반으로 학습하며 구현하는 경량 LLM Serving Engine
+
+## 프로젝트 목표
+
+- LLaMA 계열 모델 추론
+- 다중 NVIDIA GPU 분산 추론 (Tensor/Pipeline Parallelism)
+- Kubernetes 기반 오케스트레이션
+
+## 개발 환경 설정
+
+### 사전 요구사항
+
+- Python >= 3.10
+- [uv](https://github.com/astral-sh/uv) (권장) 또는 pip
+
+### UV로 환경 설정
+
+```bash
+# 1. 가상환경 생성
+uv venv
+
+# 2. 가상환경 활성화
+source .venv/bin/activate
+
+# 3. 개발용 의존성과 함께 editable 모드로 설치
+uv pip install -e ".[dev]"
+```
+
+### 설치 확인
+
+```bash
+# 패키지 import 테스트
+python -c "import lightvllm; print(lightvllm.__version__)"
+
+# 테스트 실행
+pytest
+```
+
+## 프로젝트 구조
+
+```
+LightvLLM/
+├── lightvllm/          # 메인 패키지
+│   ├── kernels/        # CUDA 커널 Python 래퍼
+│   ├── attention/      # Attention 모듈
+│   ├── layers/         # 모델 레이어
+│   ├── models/         # 모델 구현 (LLaMA 등)
+│   └── utils/          # 유틸리티
+├── csrc/               # CUDA C++ 소스
+├── tests/              # 테스트
+├── docs/               # 문서
+└── vLLM/               # vLLM 서브모듈 (참조용)
+```
+
+## 문서
+
+- [학습 로드맵](docs/LEARNING_ROADMAP.md)

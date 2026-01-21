@@ -15,32 +15,45 @@ vLLM을 기반으로 한 LLM Serving Engine을 단계적으로 학습하고 직�
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         LightvLLM 학습 로드맵                                │
+│                      LightvLLM 학습 로드맵 (수정본)                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  Phase 1: 기초           Phase 2: 핵심             Phase 3: 모델            │
-│  ┌───────────────┐       ┌───────────────┐        ┌───────────────┐        │
-│  │ CUDA 기초     │       │ Attention     │        │ Model Loader  │        │
-│  │ PyTorch Ext   │  ──▶  │ KV Cache      │  ──▶   │ Layers        │        │
-│  │ 기본 커널     │       │ Paged Attn    │        │ LLaMA 구현    │        │
-│  └───────────────┘       └───────────────┘        └───────────────┘        │
-│         │                       │                        │                 │
-│         ▼                       ▼                        ▼                 │
-│  Phase 4: 스케줄링       Phase 5: 분산              Phase 6: 서버           │
-│  ┌───────────────┐       ┌───────────────┐        ┌───────────────┐        │
-│  │ Scheduler     │       │ Ray 분석      │        │ API Server    │        │
-│  │ Batching      │  ──▶  │ TP/PP 구현    │  ──▶   │ OpenAI 호환   │        │
-│  │ Engine        │       │ K8s 전환      │        │ Streaming     │        │
-│  └───────────────┘       └───────────────┘        └───────────────┘        │
+│  Phase 1: LLaMA 기초 추론                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1.1 CUDA 기초    →  1.2 전체 커널    →  1.3 레이어    →  1.4 LLaMA  │   │
+│  │  ┌───────────┐       ┌───────────┐      ┌───────────┐   ┌───────────┐│   │
+│  │  │ CUDA 기초  │       │ RMSNorm   │      │ Linear    │   │ 모델 로더 ││   │
+│  │  │ PyTorch   │  ──▶  │ RoPE      │  ──▶ │ MLP       │──▶│ LLaMA 구현││   │
+│  │  │ Extension │       │ SiLU+Mul  │      │ Attention │   │ HF 검증   ││   │
+│  │  └───────────┘       └───────────┘      └───────────┘   └───────────┘│   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ↓                                        │
+│  Phase 2: 최적화                Phase 3: 스케줄링        Phase 4: 분산        │
+│  ┌───────────────┐             ┌───────────────┐       ┌───────────────┐   │
+│  │ Flash Attn    │             │ Scheduler     │       │ Ray 분석      │   │
+│  │ KV Cache      │      ──▶    │ Batching      │  ──▶  │ TP/PP 구현    │   │
+│  │ Paged Attn    │             │ Engine        │       │ K8s 전환      │   │
+│  └───────────────┘             └───────────────┘       └───────────────┘   │
+│                                                                 ↓           │
+│                                                        Phase 5: 서버        │
+│                                                        ┌───────────────┐   │
+│                                                        │ API Server    │   │
+│                                                        │ OpenAI 호환   │   │
+│                                                        │ Streaming     │   │
+│                                                        └───────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**핵심 변경사항:**
+- LLaMA 추론에 필요한 모든 커널/레이어를 먼저 구현하여 **정확성 검증** 가능
+- Flash Attention, Paged Attention 등 최적화는 기본 추론 검증 후 진행
+
 ---
 
-## Phase 1: CUDA 및 PyTorch Extension 기초
+## Phase 1: LLaMA 기초 추론 (검증 가능한 최소 구현)
 
-### 1.1 CUDA 프로그래밍 기초
+### 1.1 CUDA 및 PyTorch Extension 기초
 
 **목표:** CUDA 커널 작성 및 PyTorch와의 연동 이해
 
@@ -59,204 +72,157 @@ vLLM을 기반으로 한 LLM Serving Engine을 단계적으로 학습하고 직�
 2. PyTorch Extension 빌드 및 Python 호출
 3. PyTorch 내장 연산과 성능 비교
 
-### 1.2 LLM 기본 연산 커널
+### 1.2 LLaMA 필수 커널 구현
 
-**목표:** Transformer에서 사용되는 기본 연산 구현
+**목표:** LLaMA 추론에 필요한 모든 기본 커널 구현
 
-**학습 내용:**
-- RMSNorm (LLaMA에서 사용)
-- SiLU/GELU Activation
-- Fused 커널의 이점
+**LLaMA 추론 흐름:**
+```
+Embedding → (RMSNorm → Attention → RMSNorm → MLP) × N → RMSNorm → LM Head → Sampling
+```
 
-**vLLM 참고 파일:**
-- `vLLM/csrc/layernorm_kernels.cu`
-- `vLLM/csrc/activation_kernels.cu`
+**필수 커널 목록:**
+
+| 커널 | 용도 | vLLM 참고 파일 |
+|------|------|----------------|
+| RMSNorm | 정규화 | `csrc/layernorm_kernels.cu` |
+| Fused Add + RMSNorm | 잔차 연결 + 정규화 | `csrc/layernorm_kernels.cu` |
+| Rotary Embedding (RoPE) | 위치 인코딩 | `csrc/pos_encoding_kernels.cu` |
+| SiLU + Mul | MLP 활성화 | `csrc/activation_kernels.cu` |
 
 **구현 과제:**
-1. RMSNorm 커널 구현 (forward)
-2. Fused SiLU-Gate 커널 구현
-3. 수치 정확성 검증
+1. RMSNorm 커널 구현
+   - 입력: `[batch, seq_len, hidden_size]`
+   - 연산: `x / sqrt(mean(x^2) + eps) * weight`
+2. Fused Add + RMSNorm 구현
+   - 잔차 연결과 정규화를 한 번에 처리
+3. Rotary Position Embedding 구현
+   - Query, Key에 회전 변환 적용
+4. SiLU + Mul 커널 구현
+   - `SiLU(gate) * up` fused 연산
+
+**검증:** 각 커널의 출력을 PyTorch 순수 구현과 비교
+
+### 1.3 모델 레이어 구현
+
+**목표:** LLaMA 구성 레이어 구현
+
+**레이어 목록:**
+
+| 레이어 | 설명 | 사용하는 커널 |
+|--------|------|---------------|
+| RMSNorm | 정규화 레이어 | RMSNorm 커널 |
+| Linear | 선형 변환 | (PyTorch 기본) |
+| RotaryEmbedding | RoPE 레이어 | RoPE 커널 |
+| LlamaMLP | Gate + Up + Down | SiLU + Mul 커널 |
+| LlamaAttention | Multi-Head Attention | RoPE, (naive attention) |
+
+**vLLM 참고 파일:**
+- `vLLM/vllm/model_executor/layers/linear.py`
+- `vLLM/vllm/model_executor/layers/rotary_embedding.py`
+- `vLLM/vllm/model_executor/layers/activation.py`
+- `vLLM/vllm/model_executor/layers/layernorm.py`
+
+**구현 과제:**
+1. RMSNorm 레이어 (커널 래핑)
+2. Linear 레이어 (추상화 준비)
+3. RotaryEmbedding 레이어
+4. LlamaMLP 레이어 (Gate + Up + Down)
+5. LlamaAttention 레이어 (**naive PyTorch 구현**)
+   - 최적화 없이 정확성 검증용
+   - 기본 KV Cache 지원
+
+### 1.4 LLaMA 모델 구현 및 검증
+
+**목표:** 완전한 LLaMA 모델 구현 및 HuggingFace와 출력 비교
+
+**LLaMA 아키텍처:**
+```
+LlamaForCausalLM
+├── LlamaModel
+│   ├── Embedding (token → hidden)
+│   ├── LlamaDecoderLayer × N
+│   │   ├── RMSNorm (input)
+│   │   ├── LlamaAttention
+│   │   ├── Residual + RMSNorm
+│   │   └── LlamaMLP + Residual
+│   └── RMSNorm (final)
+└── LMHead (hidden → vocab)
+```
+
+**vLLM 참고 파일:**
+- `vLLM/vllm/model_executor/models/llama.py`
+
+**구현 과제:**
+1. HuggingFace 모델 로더 구현
+   - Safetensors 파일 읽기
+   - 가중치 변환 및 매핑
+2. LlamaDecoderLayer 구현
+3. LlamaModel 전체 조립
+4. LlamaForCausalLM (LM Head 포함)
+
+**검증 방법:**
+```python
+# HuggingFace와 출력 비교
+hf_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+light_model = LightvLLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+input_ids = tokenizer("Hello, world!", return_tensors="pt").input_ids
+
+hf_output = hf_model(input_ids).logits
+light_output = light_model(input_ids).logits
+
+assert torch.allclose(hf_output, light_output, atol=1e-4)
+```
 
 ---
 
-## Phase 2: Attention 및 KV Cache
+## Phase 2: 최적화 (Attention & KV Cache)
 
-### 2.1 Self-Attention 이해
+> **전제조건:** Phase 1 완료 후 HuggingFace와 출력 일치 확인
 
-**목표:** Transformer Attention의 동작 원리 이해
+### 2.1 Flash Attention 통합
+
+**목표:** Flash Attention 패키지 사용법 습득 및 통합
 
 **학습 내용:**
-- Scaled Dot-Product Attention 수식
-- Multi-Head Attention 구조
-- Causal Masking
+- Standard Attention의 메모리 복잡도 문제 (O(N²) 메모리)
+- Tiling 기반 접근법 (Block-wise 계산)
+- Online Softmax 알고리즘
+
+**핵심 논문:**
+- "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (Dao et al., 2022)
+- "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (Dao, 2023)
 
 **vLLM 참고 파일:**
-- `vLLM/vllm/attention/layer.py`
-- `vLLM/vllm/attention/backends/`
+- `vLLM/vllm/attention/utils/fa_utils.py`
+- `vLLM/vllm/v1/attention/backends/flash_attn.py`
 
 **구현 과제:**
-1. 순수 PyTorch Attention 구현
-2. Multi-Head Attention 구현
-3. Flash Attention 논문 분석
+1. flash-attn 패키지 설치 및 기본 사용법 익히기
+2. Attention 백엔드 추상화 레이어 구현
+3. Flash Attention 백엔드 구현
+4. Naive vs Flash Attention 성능 비교
 
-### 2.2 KV Cache 메커니즘
+### 2.2 KV Cache 고도화
 
-**목표:** Autoregressive 생성에서 KV Cache의 역할 이해
+**목표:** 효율적인 KV Cache 관리 구현
 
 **학습 내용:**
 - Prefill vs Decode 단계
 - Cache 메모리 관리
-- Cache Miss/Hit 영향
+- Cache 재사용 전략
 
 **vLLM 참고 파일:**
 - `vLLM/vllm/config/cache.py`
 - `vLLM/csrc/cache_kernels.cu`
 
 **구현 과제:**
-1. 기본 KV Cache 구조 구현
+1. KV Cache 관리자 구현
 2. Cache 할당/재사용 로직 구현
 3. 메모리 사용량 분석
 
-### 2.3 Flash Attention 심화 학습
-
-**목표:** Flash Attention의 원리 이해, 사용법 습득, 가능하다면 직접 구현
-
-#### 2.3.1 Flash Attention 이론
-
-**학습 내용:**
-- Standard Attention의 메모리 복잡도 문제 (O(N²) 메모리)
-- Tiling 기반 접근법 (Block-wise 계산)
-- Online Softmax 알고리즘 (numerically stable)
-- IO-Aware 알고리즘 설계 원칙
-- Flash Attention 2 vs 3 차이점
-
-**핵심 논문:**
-- "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (Dao et al., 2022)
-- "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (Dao, 2023)
-
-**수식 이해:**
-```
-Standard: O = softmax(QK^T / √d) V
-- QK^T 전체를 메모리에 저장 → O(N²) 메모리
-
-Flash:
-- Q, K, V를 블록으로 분할
-- 각 블록별로 부분 softmax 계산
-- Online algorithm으로 점진적 결합
-- O(N) 메모리로 exact attention 계산
-```
-
-#### 2.3.2 vLLM에서의 Flash Attention 통합 분석
-
-**vLLM 참고 파일:**
-- `vLLM/vllm/attention/utils/fa_utils.py` - FA 유틸리티 및 버전 관리
-- `vLLM/vllm/v1/attention/backends/flash_attn.py` - FA 백엔드 구현
-- `vLLM/vllm/attention/backends/registry.py` - 백엔드 레지스트리
-- `vLLM/vllm/platforms/cuda.py` - 백엔드 선택 로직
-- `vLLM/csrc/cache_kernels.cu` - `reshape_and_cache_flash` 커널
-
-**핵심 함수 분석:**
-```python
-# 메인 Attention 호출
-flash_attn_varlen_func(
-    q=query,                    # [num_tokens, num_heads, head_dim]
-    k=key_cache,                # Paged KV cache
-    v=value_cache,
-    cu_seqlens_q=query_start_loc,  # Cumulative sequence lengths
-    max_seqlen_q=max_query_len,
-    seqused_k=seq_lens,
-    max_seqlen_k=max_seq_len,
-    softmax_scale=scale,
-    causal=True,
-    block_table=block_table,    # Paged attention용
-    scheduler_metadata=...,      # FA3 AOT scheduling
-)
-
-# KV Cache 저장 (CUDA 커널)
-reshape_and_cache_flash(
-    key, value,
-    key_cache, value_cache,
-    slot_mapping,
-    kv_cache_dtype,
-    k_scale, v_scale,  # FP8 양자화용
-)
-```
-
-**백엔드 선택 우선순위 (CUDA):**
-```
-Non-MLA 모델:
-1. FLASH_ATTN (기본)
-2. FLASHINFER
-3. TRITON_ATTN
-4. FLEX_ATTENTION
-
-MLA 모델 (Blackwell):
-1. CUTLASS_MLA
-2. FLASHINFER_MLA
-3. FLASH_ATTN_MLA
-```
-
-#### 2.3.3 Flash Attention 사용법 실습
-
-**구현 과제:**
-1. flash-attn 패키지 설치 및 기본 사용법 익히기
-2. `flash_attn_varlen_func` 직접 호출하여 Attention 계산
-3. vLLM 스타일로 백엔드 추상화 레이어 구현
-4. Paged KV Cache와 Flash Attention 연동
-
-**실습 코드 예시:**
-```python
-from flash_attn import flash_attn_varlen_func
-
-# Variable length attention
-output = flash_attn_varlen_func(
-    q, k, v,
-    cu_seqlens_q,      # [batch_size + 1]
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    softmax_scale=1.0 / math.sqrt(head_dim),
-    causal=True,
-)
-```
-
-#### 2.3.4 Flash Attention 직접 구현 (선택적)
-
-**목표:** Triton으로 Simplified Flash Attention 구현
-
-**단계별 구현:**
-1. **Basic Tiled Attention**: 블록 단위 QK^T 계산
-2. **Online Softmax**: 점진적 softmax 계산
-3. **Full Flash Attention**: 블록별 결과 결합
-
-**Triton 구현 참고:**
-```python
-@triton.jit
-def flash_attn_kernel(
-    Q, K, V, Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, N_CTX,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-):
-    # Tiled attention computation
-    # 1. Load Q block
-    # 2. Iterate over K, V blocks
-    # 3. Compute partial attention with online softmax
-    # 4. Store output
-    pass
-```
-
-**구현 난이도별 목표:**
-- **기본**: flash-attn 패키지 사용법 완전 숙지
-- **중급**: vLLM 백엔드 인터페이스 이해 및 커스텀 백엔드 작성
-- **고급**: Triton으로 Flash Attention 핵심 로직 직접 구현
-
-### 2.4 Paged Attention (vLLM 핵심)
+### 2.3 Paged Attention (vLLM 핵심)
 
 **목표:** vLLM의 핵심 기술인 Paged Attention 완전 이해
 
@@ -265,7 +231,6 @@ def flash_attn_kernel(
 - Block 기반 메모리 관리
 - Block Table 구조
 - 메모리 단편화 해결
-- Flash Attention + Paged KV Cache 통합
 
 **vLLM 참고 파일:**
 - `vLLM/csrc/attention/paged_attention_v1.cu`
@@ -275,70 +240,14 @@ def flash_attn_kernel(
 **구현 과제:**
 1. Block Table 자료구조 구현
 2. Block Allocator 구현
-3. Flash Attention과 Paged KV Cache 연동 구현
+3. Paged Attention 커널 구현 (또는 통합)
+4. Flash Attention + Paged KV Cache 연동
 
 ---
 
-## Phase 3: 모델 실행 계층
+## Phase 3: 스케줄링 및 배칭
 
-### 3.1 모델 로딩
-
-**목표:** HuggingFace 모델의 효율적 로딩
-
-**학습 내용:**
-- Safetensors 포맷
-- 메모리 매핑 (lazy loading)
-- 가중치 변환
-
-**vLLM 참고 파일:**
-- `vLLM/vllm/model_executor/model_loader/`
-- `vLLM/vllm/model_executor/parameter.py`
-
-**구현 과제:**
-1. HuggingFace 모델 메타데이터 파싱
-2. Safetensors 로더 구현
-3. 메모리 효율적 로딩 구현
-
-### 3.2 레이어 구현
-
-**목표:** LLM 구성 레이어 구현
-
-**학습 내용:**
-- Linear Layer
-- Rotary Position Embedding (RoPE)
-- MLP (Gate + Up + Down)
-
-**vLLM 참고 파일:**
-- `vLLM/vllm/model_executor/layers/linear.py`
-- `vLLM/vllm/model_executor/layers/rotary_embedding.py`
-
-**구현 과제:**
-1. Linear Layer (추상화 포함)
-2. RoPE 구현
-3. LLaMA MLP 구현
-
-### 3.3 LLaMA 모델 구현
-
-**목표:** 완전한 LLaMA 모델 구현
-
-**학습 내용:**
-- LLaMA 아키텍처 분석
-- Decoder Block 구조
-- 추상화 설계 (향후 모델 확장용)
-
-**vLLM 참고 파일:**
-- `vLLM/vllm/model_executor/models/` - 200+ 모델 참조
-
-**구현 과제:**
-1. LLaMA Decoder Block 구현
-2. 전체 모델 조립
-3. HuggingFace 모델과 출력 비교 검증
-
----
-
-## Phase 4: 스케줄링 및 배칭
-
-### 4.1 요청 스케줄링
+### 3.1 요청 스케줄링
 
 **목표:** 다중 요청 처리를 위한 스케줄러 구현
 
@@ -357,7 +266,7 @@ def flash_attn_kernel(
 2. FCFS 스케줄러 구현
 3. 메모리 기반 승인 제어 구현
 
-### 4.2 배치 처리
+### 3.2 배치 처리
 
 **목표:** 효율적인 동적 배칭 구현
 
@@ -374,7 +283,7 @@ def flash_attn_kernel(
 2. 가변 길이 시퀀스 처리
 3. 처리량 벤치마크
 
-### 4.3 LLM Engine
+### 3.3 LLM Engine
 
 **목표:** 전체 추론 파이프라인 관리 엔진 구현
 
@@ -394,9 +303,9 @@ def flash_attn_kernel(
 
 ---
 
-## Phase 5: 분산 추론 (핵심)
+## Phase 4: 분산 추론
 
-### 5.1 분산 병렬화 기초
+### 4.1 분산 병렬화 기초
 
 **목표:** Tensor/Pipeline Parallelism 이해
 
@@ -415,7 +324,7 @@ def flash_attn_kernel(
 2. 간단한 TP 예제 구현
 3. 간단한 PP 예제 구현
 
-### 5.2 Ray 분산 실행 분석
+### 4.2 Ray 분산 실행 분석
 
 **목표:** vLLM의 Ray 기반 분산 실행 완전 이해
 
@@ -429,26 +338,18 @@ def flash_attn_kernel(
 ```
 vLLM/vllm/v1/executor/
 ├── abstract.py          # Executor 추상 인터페이스
-├── ray_executor.py      # Ray 분산 Executor (624줄)
-├── ray_utils.py         # Worker Wrapper (469줄)
+├── ray_executor.py      # Ray 분산 Executor
+├── ray_utils.py         # Worker Wrapper
 ├── multiproc_executor.py # 멀티프로세스 Executor
 └── uniproc_executor.py  # 단일 프로세스 Executor
-
-vLLM/vllm/distributed/
-├── parallel_state.py    # 병렬 상태 관리
-├── device_communicators/
-│   ├── ray_communicator.py  # Ray PP 통신
-│   └── custom_all_reduce.py # 커스텀 AllReduce
-└── kv_transfer/         # KV Cache 전송
 ```
 
 **분석 과제:**
 1. `RayDistributedExecutor` 클래스 분석
 2. Worker 생성 및 Rank 할당 로직 분석
 3. Compiled DAG 실행 흐름 분석
-4. 중간 텐서 전송 메커니즘 분석
 
-### 5.3 Kubernetes 기반 오케스트레이션 설계
+### 4.3 Kubernetes 기반 오케스트레이션 설계
 
 **목표:** Ray를 Kubernetes로 대체하기 위한 설계
 
@@ -461,36 +362,6 @@ vLLM/vllm/distributed/
 | `collective_rpc()` | gRPC Fan-out/Fan-in |
 | Compiled DAG | Custom Controller + CRD |
 | Worker Discovery | K8s API + DNS |
-| Env Propagation | ConfigMap/Secret |
-
-**설계 과제:**
-1. Worker Pod 사양 설계 (GPU 리소스, 네트워크)
-2. gRPC 서비스 인터페이스 정의
-3. Custom Resource Definition (CRD) 설계
-4. Controller 로직 설계
-
-### 5.4 분산 추론 구현
-
-**목표:** Kubernetes 기반 분산 추론 구현
-
-**구현 단계:**
-
-```
-Step 1: 단일 노드 멀티 GPU (TP)
-├── torch.distributed 기반 통신
-├── NCCL AllReduce/AllGather
-└── 단일 프로세스 그룹
-
-Step 2: 멀티 노드 (PP)
-├── gRPC 기반 중간 텐서 전송
-├── 파이프라인 스테이지 동기화
-└── 노드 간 통신 최적화
-
-Step 3: Kubernetes 통합
-├── Custom Controller 구현
-├── Pod 라이프사이클 관리
-└── 동적 스케일링
-```
 
 **구현 과제:**
 1. TP-aware Linear Layer 구현
@@ -500,9 +371,9 @@ Step 3: Kubernetes 통합
 
 ---
 
-## Phase 6: API 서버
+## Phase 5: API 서버
 
-### 6.1 HTTP API 서버
+### 5.1 HTTP API 서버
 
 **목표:** OpenAI 호환 API 서버 구현
 
@@ -520,7 +391,7 @@ Step 3: Kubernetes 통합
 2. `/v1/completions` 구현
 3. `/v1/chat/completions` 구현
 
-### 6.2 스트리밍 응답
+### 5.2 스트리밍 응답
 
 **목표:** SSE 기반 토큰 스트리밍 구현
 
@@ -539,19 +410,19 @@ Step 3: Kubernetes 통합
 
 ---
 
-## Phase 7: 고급 주제 (향후)
+## Phase 6: 고급 주제 (향후)
 
-### 7.1 양자화
+### 6.1 양자화
 - INT8/INT4 양자화 지원
 - GPTQ, AWQ 포맷
 - 참고: `vLLM/vllm/model_executor/layers/quantization/`
 
-### 7.2 Speculative Decoding
+### 6.2 Speculative Decoding
 - Draft 모델 기반 가속
 - 토큰 검증 메커니즘
 - 참고: `vLLM/vllm/v1/spec_decode/`
 
-### 7.3 Heterogeneous GPU
+### 6.3 Heterogeneous GPU
 - 다른 종류의 GPU 혼합 사용
 - 로드 밸런싱 전략
 - 메모리 이종성 처리
@@ -560,27 +431,27 @@ Step 3: Kubernetes 통합
 
 ## 마일스톤
 
-### Milestone 1: 기초 완료
-- [ ] CUDA 커널 3개 이상 구현
+### Milestone 1: LLaMA 기초 추론 ⭐ (핵심)
+- [ ] RMSNorm, RoPE, SiLU+Mul 커널 구현
 - [ ] PyTorch Extension 빌드 성공
-- [ ] 단위 테스트 통과
+- [ ] 모든 레이어 구현 (Linear, MLP, Attention)
+- [ ] LLaMA 모델 로더 구현
+- [ ] **HuggingFace와 출력 일치 확인** ✓
 
-### Milestone 2: Flash Attention 통합
-- [ ] flash-attn 패키지 사용법 숙지
+### Milestone 2: Attention 최적화
+- [ ] Flash Attention 통합
 - [ ] 백엔드 추상화 레이어 구현
-- [ ] Flash Attention vs Standard Attention 성능 비교
-- [ ] (선택) Triton으로 Simplified Flash Attention 구현
+- [ ] Flash vs Naive 성능 비교
 
-### Milestone 3: 단일 GPU 추론
-- [ ] LLaMA 모델 로딩 성공
-- [ ] 단일 GPU에서 텍스트 생성 성공
-- [ ] HuggingFace와 출력 일치 확인
-
-### Milestone 4: Paged Attention
+### Milestone 3: Paged Attention
 - [ ] Paged Attention 구현
 - [ ] Flash Attention + Paged KV Cache 연동
 - [ ] 메모리 효율성 개선 확인
-- [ ] 다중 요청 처리 가능
+
+### Milestone 4: 다중 요청 처리
+- [ ] Continuous Batching 구현
+- [ ] Scheduler 구현
+- [ ] Engine 클래스 완성
 
 ### Milestone 5: 분산 추론 (TP)
 - [ ] 단일 노드 멀티 GPU 동작
