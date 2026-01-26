@@ -4,6 +4,7 @@ Version: 0.1.0
 Summary: A lightweight LLM serving engine for learning purposes
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.10.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0.0; extra == "dev"
 
