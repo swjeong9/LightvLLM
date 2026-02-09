@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .python-version
 .vscode/
+
+# 컴파일된 테스트 바이너리
+tests/bin/

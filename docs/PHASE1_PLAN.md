@@ -34,15 +34,17 @@ Text → Tokenizer → Embedding (PyTorch) → RoPE → Attention → MLP (SiLU+
 
 ### 구현 순서
 
-1. **`csrc/pos_encoding_kernels.cu`** - RoPE CUDA 커널
+1. **`csrc/pos_encoding_kernels.cu`** - RoPE CUDA 커널 ✅
    - RoPE 수학적 원리 (2D 회전 변환)
    - Query, Key에 위치 정보 인코딩
 
-2. **`csrc/torch_bindings.cpp`** - PyTorch 바인딩
+2. **Low-level C++ 테스트** - PyTorch 없이 커널 직접 테스트 ← 현재 진행
+   - 커널 로직이 정확한지 먼저 검증
 
-3. **Low-level C++ 테스트** - PyTorch 없이 커널 직접 테스트
+3. **`csrc/torch_bindings.cpp`** - PyTorch 바인딩
+   - 검증된 커널을 PyTorch에 연결
 
-4. **컴파일 및 테스트**
+4. **PyTorch 테스트** - Python에서 바인딩 동작 검증
 
 ---
 
