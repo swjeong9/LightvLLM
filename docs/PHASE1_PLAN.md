@@ -28,10 +28,6 @@ Text → Tokenizer → Embedding (PyTorch) → RoPE → Attention → MLP (SiLU+
 - C++ 템플릿과 런타임 타입 문제 해결
 - `VLLM_DISPATCH_FLOATING_TYPES` 매크로
 
-### 3. `.vscode/c_cpp_properties.json`
-- VS Code IntelliSense 설정
-- PyTorch, CUDA 헤더 경로 추가
-
 ---
 
 ## 다음 작업: RoPE (Rotary Position Embedding)
