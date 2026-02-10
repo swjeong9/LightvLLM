@@ -50,7 +50,7 @@ dev = [
 # 빌드에 필요한 패키지들 (빌드 전에 임시로 설치됨)
 # - setuptools: Python 패키지 빌드 도구 (가장 전통적)
 # - wheel: .whl 바이너리 배포 형식 지원
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "torch>=2.8.0"]
 
 # 빌드 백엔드 (setuptools의 PEP 517 호환 인터페이스)
 build-backend = "setuptools.build_meta"

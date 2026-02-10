@@ -7,7 +7,14 @@
 
 #include <torch/extension.h>
 
-// TODO: Add kernel declarations and bindings
+// Position encoding kernels
+void rotary_embedding(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    torch::Tensor& key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Activation kernels
@@ -19,5 +26,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("fused_add_rms_norm", &fused_add_rms_norm, "Fused Add + RMS Norm");
 
     // Position encoding kernels
-    // m.def("rotary_embedding", &rotary_embedding, "Rotary Position Embedding");
+    m.def("rotary_embedding", &rotary_embedding, "Rotary Position Embedding");
 }
+

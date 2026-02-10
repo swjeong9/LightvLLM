@@ -1,5 +1,8 @@
 README.md
 pyproject.toml
+setup.py
+csrc/pos_encoding_kernels.cu
+csrc/torch_bindings.cpp
 lightvllm/__init__.py
 lightvllm.egg-info/PKG-INFO
 lightvllm.egg-info/SOURCES.txt
