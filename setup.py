@@ -21,6 +21,7 @@ setup(
                 "csrc/torch_bindings.cpp",
                 "csrc/pos_encoding_kernels.cu",
                 "csrc/layernorm_kernels.cu",
+                "csrc/activation_kernels.cu",
             ],
             include_dirs=["csrc"],
         ),

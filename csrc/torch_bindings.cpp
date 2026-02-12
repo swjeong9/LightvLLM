@@ -7,6 +7,10 @@
 
 #include <torch/extension.h>
 
+// Activation kernels
+void silu(torch::Tensor& out, torch::Tensor& input);
+void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+
 // Position encoding kernels
 void rotary_embedding(
     torch::Tensor& positions,
@@ -31,8 +35,8 @@ void fused_add_rms_norm(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Activation kernels
-    // m.def("silu", &silu, "SiLU activation");
-    // m.def("silu_and_mul", &silu_and_mul, "SiLU activation with multiplication");
+    m.def("silu", &silu, "SiLU activation (x * sigmoid(x))");
+    m.def("silu_and_mul", &silu_and_mul, "Fused SiLU + Mul for LLaMA MLP gate");
 
     // LayerNorm kernels
     m.def("rms_norm", &rms_norm, "RMS Normalization");

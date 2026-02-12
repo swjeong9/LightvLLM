@@ -1,4 +1,6 @@
+numpy>=2.2.6
 torch>=2.8.0
 
 [dev]
 pytest>=7.0.0
+transformers

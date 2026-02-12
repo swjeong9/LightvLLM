@@ -9,5 +9,7 @@ __pycache__/
 build/
 
 
-# 컴파일된 테스트 바이너리
+# 컴파일된 바이너리
+*.so
+*.egg-info/
 tests/bin/

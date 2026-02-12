@@ -23,6 +23,7 @@ requires-python = ">=3.10"
 # 필수 의존성 (pip install lightvllm 시 자동 설치)
 # 현재는 외부 의존성 없음 (torch 등은 나중에 추가 예정)
 dependencies = [
+    "numpy>=2.2.6",
     "torch>=2.8.0",
 ]
 
@@ -37,6 +38,7 @@ dependencies = [
 # 설치: pip install -e ".[dev]" 또는 uv pip install -e ".[dev]"
 dev = [
     "pytest>=7.0.0",  # 테스트 프레임워크
+    "transformers"
 ]
 
 

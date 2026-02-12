@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 setup.py
+csrc/activation_kernels.cu
 csrc/layernorm_kernels.cu
 csrc/pos_encoding_kernels.cu
 csrc/torch_bindings.cpp
@@ -21,6 +22,7 @@ lightvllm/kernels/activation.py
 lightvllm/kernels/layernorm.py
 lightvllm/kernels/pos_encoding.py
 lightvllm/layers/__init__.py
+lightvllm/layers/activation.py
 lightvllm/layers/linear.py
 lightvllm/layers/mlp.py
 lightvllm/layers/normalization.py

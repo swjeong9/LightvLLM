@@ -93,16 +93,105 @@ CUDA 커널을 PyTorch GPU 참조 구현과 비교하는 테스트 (기본 dtype
   - Test 4 — Half Dtypes: float16, bfloat16 파라미터화 테스트
   - Test 5 — Large Scale: LLaMA-like 설정 (1024토큰, 32헤드, 8 KV헤드, 128 head_size)
 
+### 10. CUB 호환 헤더 — `csrc/cub_compat.h` (26줄) ✅
+
+CUB 2.0.8 이상에서 `cub::Sum()`이 `cuda::std::plus<>`로 변경된 호환성 문제 해결:
+
+- **`CubAddOp`**: CUB 버전에 따라 `cub::Sum()` 또는 `cuda::std::plus<void>()` 자동 선택
+
+### 11. RMSNorm 순수 CUDA 헤더 — `csrc/layernorm_kernels.cuh` (245줄) ✅
+
+PyTorch 의존성 없이 사용 가능한 RMSNorm 커널 헤더. CUB `BlockReduce`를 사용한 효율적인 병렬 리덕션:
+
+- **`rms_norm_kernel<scalar_t>()`**: Two-Pass 알고리즘. Pass 1에서 fp32로 제곱합 누적 + BlockReduce + rsqrt 계산 및 `__shared__` 브로드캐스트, Pass 2에서 정규화 적용. Grid=(num_tokens), Block=(block_size).
+- **`fused_add_rms_norm_kernel<scalar_t>()`**: 잔차 덧셈 + RMSNorm을 하나의 커널에서 수행. Pass 1에서 `residual += input`과 제곱합 누적을 동시에 처리하여 글로벌 메모리 읽기 1회 절약. 두 텐서 모두 in-place 수정.
+
+### 12. RMSNorm PyTorch 연동 — `csrc/layernorm_kernels.cu` (249줄) ✅
+
+RMSNorm의 수학적 원리(LLaMA Pre-Norm 구조, LayerNorm 비교, Fused 커널의 메모리 대역폭 분석)에 대한 상세 교육 문서와 함께 PyTorch 진입점 함수 구현:
+
+- **`rms_norm()`**: 출력 텐서에 정규화 결과 저장. 블록 크기 휴리스틱(토큰 수 < 256이면 1024, 아니면 256) 적용.
+- **`fused_add_rms_norm()`**: input과 residual을 in-place로 수정. `VLLM_DISPATCH_FLOATING_TYPES`로 dtype 디스패치.
+
+### 13. Python 래퍼 및 nn.Module ✅
+
+- **`lightvllm/kernels/layernorm.py`** (61줄): `rms_norm()`, `fused_add_rms_norm()` Python 래퍼 함수
+- **`lightvllm/layers/normalization.py`** (70줄): `RMSNorm` nn.Module 클래스. forward에서 residual 유무에 따라 `rms_norm` / `fused_add_rms_norm` 자동 분기.
+
+### 14. RMSNorm 테스트 ✅
+
+**C++ Low-level 테스트** — `tests/test_layernorm_kernel.cu`:
+- Test 1 — RMSNorm 기본 정확성 (CPU 참조 vs GPU)
+- Test 2 — Fused Add+RMSNorm 정확성 (CPU 참조 재사용)
+- Test 3 — 영벡터 입력 안정성 (NaN/Inf 없음)
+- Test 4 — Fused vs Non-Fused 성능 비교 (1.56x 속도 향상)
+
+**Python 통합 테스트** — `tests/kernels/test_layernorm.py` (16개 테스트):
+- 기본 정확성 (bf16), Fused 커널 정확성, residual bit-exact 검증
+- 단위 가중치 수학적 성질, 영벡터 안정성
+- half dtype별 (fp16, bf16) 검증, 대규모 텐서 (1024×4096)
+- 다양한 hidden_size (128~8192) 파라미터화
+- HuggingFace `LlamaRMSNorm`과의 정확성 비교
+- 성능 벤치마크: HuggingFace vs PyTorch 참조 vs CUDA 커널 vs Non-Fused vs Fused
+
+### 15. Activation 순수 CUDA 헤더 — `csrc/activation_kernels.cuh` (412줄) ✅
+
+128-bit 벡터화를 도입한 SiLU 활성화 커널 헤더:
+
+- **`silu_kernel<T>()`**: SiLU 활성화 함수. `__device__ __forceinline__`, fp32 중간 연산으로 수치 안정성 확보.
+- **`activation_kernel<scalar_t, ACT_FN>()`**: element-wise 활성화 커널. 128-bit `int4` 벡터화 + 정렬 체크 + scalar fallback 이중 경로.
+- **`act_and_mul_kernel<scalar_t, ACT_FN>()`**: Fused silu_and_mul 커널. 입력 `[..., 2*d]` → 출력 `[..., d]`. `silu(gate)` 결과를 레지스터에 유지한 채 up과 곱셈.
+
+### 16. Activation PyTorch 연동 — `csrc/activation_kernels.cu` (517줄) ✅
+
+활성화 함수 발전사(ReLU→GELU→SiLU), SwiGLU 구조, 메모리 대역폭 분석에 대한 상세 교육 문서와 함께 PyTorch 진입점 구현:
+
+- **`silu()`**: element-wise SiLU 적용. `VLLM_DISPATCH_FLOATING_TYPES`, `CUDAGuard` 사용.
+- **`silu_and_mul()`**: Fused gate 연산. 입력의 전반부에 SiLU 적용 후 후반부와 곱셈.
+
+### 17. Activation Python 래퍼 및 nn.Module ✅
+
+- **`lightvllm/kernels/activation.py`** (47줄): `silu()`, `silu_and_mul()` Python 래퍼 함수
+- **`lightvllm/layers/activation.py`** (33줄): `SiluAndMul` nn.Module 클래스 (학습 파라미터 없음)
+
+### 18. RoPE Python 래퍼 완성 ✅
+
+기존 빈 스텁을 완전 구현:
+
+- **`lightvllm/kernels/pos_encoding.py`** (34줄): `rotary_embedding()` Python 래퍼 함수
+- **`lightvllm/layers/rotary_embedding.py`** (92줄): `RotaryEmbedding` nn.Module (cos/sin 캐시 생성 + forward)
+
+### 19. Activation 테스트 ✅
+
+**C++ Low-level 테스트** — `tests/test_activation_kernel.cu` (531줄):
+- Test 1 — SiLU 기본 정확성 (GPU vs CPU 참조)
+- Test 2 — silu_and_mul 기본 정확성
+- Test 3 — SiLU 수학적 성질 (silu(0)=0, 하한값 ≈ -0.278)
+- Test 4 — 수치 안정성 (극단값에서 NaN/Inf 없음)
+- Test 5 — Non-Fused vs Fused 성능 벤치마크 (1.49x 속도 향상)
+
+**Python 통합 테스트** — `tests/kernels/test_activation.py` (31개 테스트):
+- SiLU: 기본 정확성, zero, dtype별, 큰 값, 다양한 크기, PyTorch Module 비교, 성능 벤치마크
+- silu_and_mul: 기본 정확성, shape 검증, dtype별, 대규모, 3D 입력, zero gate, unit up, 성능 벤치마크
+- 래퍼: silu/silu_and_mul 래퍼, 3D 래퍼, SiluAndMul Module
+
+### 20. 전 커널 Python 래퍼 테스트 추가 ✅
+
+기존 테스트 파일에 래퍼 계층 검증 테스트 추가 (13개):
+
+- `tests/kernels/test_activation.py`: `TestActivationWrappers` (5개)
+- `tests/kernels/test_layernorm.py`: `TestLayerNormWrappers` (4개)
+- `tests/kernels/test_rope.py`: `TestRoPEWrappers` (4개)
+
 ---
 
 ## 다음 작업 (예정)
 
 | 순서 | 작업 | 파일 | 내용 |
 |------|------|------|------|
-| 3 | RMSNorm 커널 | `csrc/layernorm_kernels.cu` | RMSNorm + Fused Add+RMSNorm CUDA 커널, Low-level 테스트 |
-| 4 | Activation 커널 | `csrc/activation_kernels.cu` | SiLU, SiLU+Mul fused 연산 (LLaMA MLP용), Low-level 테스트 |
-| 5 | Attention | `lightvllm/attention/` | Self-Attention 커널 또는 naive PyTorch 구현 |
-| 6 | Python Integration | `lightvllm/models/llama.py` | 전체 파이프라인 연결: Tokenizer → Embedding → RoPE → Attention → MLP → Output |
+| 1 | 레이어 구현 | `lightvllm/layers/` | Linear, MLP Python 레이어 |
+| 2 | Attention | `lightvllm/attention/` | Self-Attention 커널 또는 naive PyTorch 구현 |
+| 3 | Python Integration | `lightvllm/models/llama.py` | 전체 파이프라인 연결: Tokenizer → Embedding → RoPE → Attention → MLP → Output |
 
 ---
 

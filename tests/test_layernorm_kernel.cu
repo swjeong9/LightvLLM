@@ -71,38 +71,6 @@ void rms_norm_cpu_reference(
 }
 
 
-/**
- * CPU에서 Fused Add+RMSNorm 참조 구현
- *
- * Step 1: residual += input
- * Step 2: output = rms_norm(residual) * weight
- */
-void fused_add_rms_norm_cpu_reference(
-    float* input,       // 정규화 결과로 덮어씌워짐
-    float* residual,    // in-place로 업데이트
-    const float* weight,
-    float epsilon,
-    int num_tokens,
-    int hidden_size) {
-
-    for (int t = 0; t < num_tokens; t++) {
-        int offset = t * hidden_size;
-
-        // Step 1: residual += input, sum_sq 누적
-        float sum_sq = 0.0f;
-        for (int i = 0; i < hidden_size; i++) {
-            residual[offset + i] += input[offset + i];
-            float val = residual[offset + i];
-            sum_sq += val * val;
-        }
-        float rsqrt_val = 1.0f / sqrtf(sum_sq / hidden_size + epsilon);
-
-        // Step 2: normalize residual → input
-        for (int i = 0; i < hidden_size; i++) {
-            input[offset + i] = residual[offset + i] * rsqrt_val * weight[i];
-        }
-    }
-}
 
 
 // =============================================================================
@@ -140,6 +108,26 @@ void fill_random(float* arr, int n, unsigned int seed) {
     srand(seed);
     for (int i = 0; i < n; i++) {
         arr[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;  // [-1, 1]
+    }
+}
+
+
+// =============================================================================
+// Non-Fused 비교용 elementwise add 커널
+// =============================================================================
+
+/**
+ * 단순 원소별 덧셈: residual[i] += input[i]
+ * Fused 커널과의 성능 비교에서 "별도 커널 2개" 시나리오의 첫 번째 단계로 사용
+ */
+template <typename scalar_t>
+__global__ void elementwise_add_kernel(
+    scalar_t* __restrict__ residual,
+    const scalar_t* __restrict__ input,
+    int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        residual[idx] += input[idx];
     }
 }
 
@@ -238,9 +226,12 @@ bool test_fused_add_rms_norm_correctness() {
     memcpy(h_input_gpu, h_input_cpu, total * sizeof(float));
     memcpy(h_residual_gpu, h_residual_cpu, total * sizeof(float));
 
-    // CPU 참조 계산
-    fused_add_rms_norm_cpu_reference(
-        h_input_cpu, h_residual_cpu, h_weight, epsilon, num_tokens, hidden_size);
+    // CPU 참조 계산: 단순 덧셈 후 기존 rms_norm_cpu_reference 재사용
+    // (Fused는 GPU 메모리 대역폭 최적화이므로 CPU 참조에서는 불필요)
+    for (int i = 0; i < total; i++) {
+        h_residual_cpu[i] += h_input_cpu[i];
+    }
+    rms_norm_cpu_reference(h_input_cpu, h_residual_cpu, h_weight, epsilon, num_tokens, hidden_size);
 
     // GPU 메모리 할당 및 복사
     float *d_input, *d_residual, *d_weight;
@@ -342,12 +333,16 @@ bool test_zero_input_stability() {
 
 
 /**
- * Test 4: 성능 벤치마크
+ * Test 4: Fused vs Non-Fused 성능 비교
  *
- * LLaMA-like 설정에서 커널 실행 시간 측정
+ * 동일한 연산(residual += input → rms_norm(residual))을 두 가지 방식으로 수행하고
+ * latency를 비교하여 Fused 커널의 메모리 대역폭 절약 효과를 실측한다.
+ *
+ * Non-Fused: elementwise_add_kernel + rms_norm_kernel (커널 2개)
+ * Fused:     fused_add_rms_norm_kernel (커널 1개)
  */
-bool test_performance() {
-    printf("\n[Test 4] 성능 벤치마크 (LLaMA-like)\n");
+bool test_fused_vs_nonfused_performance() {
+    printf("\n[Test 4] Fused vs Non-Fused 성능 비교 (LLaMA-like)\n");
 
     const int num_tokens = 1024;
     const int hidden_size = 4096;
@@ -356,64 +351,104 @@ bool test_performance() {
     const int warmup = 10;
     const int repeat = 100;
 
-    // CPU 메모리
-    float* h_input  = (float*)malloc(total * sizeof(float));
-    float* h_weight = (float*)malloc(hidden_size * sizeof(float));
+    // CPU 메모리 (초기값 보관용)
+    float* h_input    = (float*)malloc(total * sizeof(float));
+    float* h_residual = (float*)malloc(total * sizeof(float));
+    float* h_weight   = (float*)malloc(hidden_size * sizeof(float));
     fill_random(h_input, total, 42);
+    fill_random(h_residual, total, 77);
     fill_random(h_weight, hidden_size, 123);
 
     // GPU 메모리
-    float *d_input, *d_weight, *d_out;
+    float *d_input, *d_residual, *d_weight, *d_out;
     CUDA_CHECK(cudaMalloc(&d_input, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_residual, total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_weight, hidden_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out, total * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_input, h_input, total * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_weight, h_weight, hidden_size * sizeof(float), cudaMemcpyHostToDevice));
 
-    dim3 grid(num_tokens);
-    dim3 block(256);  // num_tokens >= 256이므로 block=256 사용
+    // RMSNorm 커널 launch 설정
+    dim3 norm_grid(num_tokens);
+    dim3 norm_block(256);  // num_tokens >= 256이므로 block=256
 
-    // 워밍업
-    for (int i = 0; i < warmup; i++) {
-        lightvllm::rms_norm_kernel<float><<<grid, block>>>(
-            d_out, d_input, d_weight, epsilon, num_tokens, hidden_size);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Elementwise add 커널 launch 설정
+    dim3 add_block(256);
+    dim3 add_grid((total + 255) / 256);
 
-    // GPU 타이밍
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
+    // 데이터 초기 전송 (1회)
+    CUDA_CHECK(cudaMemcpy(d_input, h_input, total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_residual, h_residual, total * sizeof(float), cudaMemcpyHostToDevice));
+
+    // =====================================================================
+    // Non-Fused 벤치마크: elementwise_add + rms_norm (커널 2개)
+    // =====================================================================
+    // in-place 연산이지만, 벤치마크에서는 순수 커널 실행 시간만 측정.
+    // 같은 데이터를 반복 실행해도 커널 latency 측정에는 영향 없음.
+
+    // 워밍업
+    for (int i = 0; i < warmup; i++) {
+        elementwise_add_kernel<float><<<add_grid, add_block>>>(d_residual, d_input, total);
+        lightvllm::rms_norm_kernel<float><<<norm_grid, norm_block>>>(
+            d_out, d_residual, d_weight, epsilon, num_tokens, hidden_size);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 측정
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < repeat; i++) {
-        lightvllm::rms_norm_kernel<float><<<grid, block>>>(
-            d_out, d_input, d_weight, epsilon, num_tokens, hidden_size);
+        elementwise_add_kernel<float><<<add_grid, add_block>>>(d_residual, d_input, total);
+        lightvllm::rms_norm_kernel<float><<<norm_grid, norm_block>>>(
+            d_out, d_residual, d_weight, epsilon, num_tokens, hidden_size);
     }
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
-    float gpu_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, start, stop));
-    float avg_gpu_us = (gpu_ms / repeat) * 1000.0f;
+    float nonfused_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&nonfused_ms, start, stop));
+    float avg_nonfused_us = (nonfused_ms / repeat) * 1000.0f;
 
-    // CPU 타이밍
-    float* h_out_cpu = (float*)malloc(total * sizeof(float));
-    clock_t cpu_start = clock();
-    for (int i = 0; i < repeat; i++) {
-        rms_norm_cpu_reference(h_out_cpu, h_input, h_weight, epsilon, num_tokens, hidden_size);
+    // =====================================================================
+    // Fused 벤치마크: fused_add_rms_norm (커널 1개)
+    // =====================================================================
+
+    // 데이터 리셋
+    CUDA_CHECK(cudaMemcpy(d_input, h_input, total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_residual, h_residual, total * sizeof(float), cudaMemcpyHostToDevice));
+
+    // 워밍업
+    for (int i = 0; i < warmup; i++) {
+        lightvllm::fused_add_rms_norm_kernel<float><<<norm_grid, norm_block>>>(
+            d_input, d_residual, d_weight, epsilon, num_tokens, hidden_size);
     }
-    clock_t cpu_end = clock();
-    float avg_cpu_us = ((float)(cpu_end - cpu_start) / CLOCKS_PER_SEC / repeat) * 1e6f;
+    CUDA_CHECK(cudaDeviceSynchronize());
 
+    // 측정
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < repeat; i++) {
+        lightvllm::fused_add_rms_norm_kernel<float><<<norm_grid, norm_block>>>(
+            d_input, d_residual, d_weight, epsilon, num_tokens, hidden_size);
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float fused_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&fused_ms, start, stop));
+    float avg_fused_us = (fused_ms / repeat) * 1000.0f;
+
+    // 결과 출력
     printf("  설정: num_tokens=%d, hidden_size=%d\n", num_tokens, hidden_size);
-    printf("  GPU: %.1f us/call (평균 %d회)\n", avg_gpu_us, repeat);
-    printf("  CPU: %.1f us/call (평균 %d회)\n", avg_cpu_us, repeat);
-    printf("  속도 향상: %.1fx\n", avg_cpu_us / avg_gpu_us);
+    printf("  Non-Fused (add + rms_norm): %.1f us/call\n", avg_nonfused_us);
+    printf("  Fused (fused_add_rms_norm):  %.1f us/call\n", avg_fused_us);
+    printf("  Fused 속도 향상: %.2fx\n", avg_nonfused_us / avg_fused_us);
     printf("  결과: PASS (벤치마크)\n");
 
-    free(h_input); free(h_weight); free(h_out_cpu);
+    free(h_input); free(h_residual); free(h_weight);
     CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_residual));
     CUDA_CHECK(cudaFree(d_weight));
     CUDA_CHECK(cudaFree(d_out));
     CUDA_CHECK(cudaEventDestroy(start));
@@ -438,7 +473,7 @@ int main() {
     if (test_rms_norm_correctness())       passed++;
     if (test_fused_add_rms_norm_correctness()) passed++;
     if (test_zero_input_stability())        passed++;
-    if (test_performance())                 passed++;
+    if (test_fused_vs_nonfused_performance()) passed++;
 
     printf("\n=============================================================================\n");
     printf("결과: %d/%d 테스트 통과\n", passed, total);
