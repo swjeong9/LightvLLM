@@ -33,10 +33,40 @@ tests/kernels/test_xxx.py → Python 통합 테스트
 
 새 커널 추가 시: `csrc/torch_bindings.cpp`에 바인딩 추가, `setup.py`에 소스 추가.
 
+## 아키텍처: 레이어 vs 모델 구조
+
+vLLM 패턴을 따른다:
+
+```
+lightvllm/layers/       → 모델에 무관한 공유 빌딩블록
+  linear.py             → Linear, MergedLinear (F.linear + weight 관리)
+  activation.py         → SiluAndMul (CUDA 커널 래퍼)
+  normalization.py      → RMSNorm (CUDA 커널 래퍼)
+  rotary_embedding.py   → RotaryEmbedding (cos/sin 캐시 + CUDA 커널)
+
+lightvllm/models/       → 모델별 아키텍처 정의
+  llama.py              → LlamaMLP, LlamaAttention, LlamaDecoderLayer, ...
+  loader.py             → HF safetensors 가중치 로더
+  base.py               → 모델 Protocol 인터페이스 (향후 추가 예정)
+```
+
+`layers/`에는 어떤 모델이든 재사용할 수 있는 primitive만 둔다.
+모델 아키텍처를 결정하는 클래스(MLP 구성, Attention head 배치 등)는 `models/`에 둔다.
+다른 모델(Mistral 등)은 `models/llama.py`의 클래스를 import해 재사용하거나,
+자체 `models/mistral.py`에 별도 정의할 수 있다.
+
+테스트도 동일 구조:
+
+```
+tests/kernels/   → CUDA 커널 + 래퍼 테스트
+tests/layers/    → 공유 빌딩블록 테스트
+tests/models/    → 모델별 테스트
+```
+
 ## 코드 스타일
 
 - `.cu/.cuh` 파일: **한국어 교육 주석** (수학적 원리, 설계 이유 상세 설명)
-- `.py` 파일: **영어 docstring**, 변수/함수는 snake_case
+- `.py` 파일: **한국어 docstring/주석**, 기술 용어(QKV, gate, GEMM 등)는 영어 유지
 - CUDA 커널: `lightvllm` 네임스페이스, `VLLM_DISPATCH_FLOATING_TYPES` 매크로로 dtype 디스패치
 - 지원 dtype: float32, float16, bfloat16
 

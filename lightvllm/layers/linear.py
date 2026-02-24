@@ -138,6 +138,11 @@ class MergedLinear(nn.Module):
             offsets.append(offsets[-1] + size)
         self._offsets = offsets
 
+        # weight_loader를 파라미터 텐서에 직접 연결.
+        # load_weights()가 getattr(param, "weight_loader")로 접근할 수 있도록 합니다.
+        # vLLM도 set_weight_attrs()로 동일한 패턴을 사용합니다.
+        self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+
     def weight_loader(
         self,
         param: nn.Parameter,
