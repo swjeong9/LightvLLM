@@ -49,12 +49,17 @@ tests/kernels/test_xxx.py → Python 통합 테스트
 
 ## Git 컨벤션
 
-- 브랜치: `phase1` (현재), `main` (안정)
-- 커밋 메시지: `complete activation(SiLU)`, `start layernorm study` 형식
+- 브랜치: `phase1` (phase 별 분기, 이후 phase2로 변경), `main` (phase 완료될 때 마다 PR 을 통한 통합)
 
-## 현재 진행 상태
+## 참조
 
-- 완료/미완 작업 목록: `docs/phase1/PLAN.md`
-- 작업 타임라인: `docs/phase1/history/OVERVIEW.md`
 - 전체 로드맵: `docs/LEARNING_ROADMAP.md`
-- vLLM 참조: `vLLM/csrc/` (git submodule)
+- vLLM 참조: `vLLM/` (git submodule)
+
+## Phase별 진행 상태
+
+각 Phase는 `docs/phase{N}/` 아래에 동일한 구조를 갖는다:
+
+- 완료/미완 작업 목록: `docs/phase{N}/PLAN.md`
+- 작업 타임라인: `docs/phase{N}/history/OVERVIEW.md`
+- 현재 Phase: **phase1** (브랜치: `phase1`)
