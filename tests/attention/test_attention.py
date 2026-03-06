@@ -5,6 +5,15 @@ NaiveAttention, SDPAAttention, KVCache의 정확성을 검증합니다.
 Llama-3.2-3B 스펙:
     num_attention_heads=24, num_kv_heads=8, head_dim=128
     GQA ratio: 24/8 = 3
+
+실행:
+    uv run pytest tests/attention/test_attention.py -v
+
+실행 (특정 클래스만):
+    uv run pytest tests/attention/test_attention.py::TestNaiveAttention -v
+
+벤치마크만:
+    uv run pytest tests/attention/test_attention.py::TestAttentionBenchmark -v -s
 """
 
 import pytest
@@ -608,3 +617,131 @@ class TestAttentionWithKVCache:
 
             cache_naive.advance(1)
             cache_sdpa.advance(1)
+
+
+# =============================================================================
+# 성능 벤치마크: Naive vs SDPA
+# =============================================================================
+
+
+class TestAttentionBenchmark:
+    """NaiveAttention vs SDPAAttention 성능 비교.
+
+    Prefill (긴 시퀀스, compute-bound)과 Decode (1토큰, memory-bound)를
+    각각 측정하여 두 backend의 특성 차이를 확인합니다.
+
+    SDPA는 내부적으로 FlashAttention/Memory-Efficient 커널을 자동 선택하므로,
+    Naive(수동 matmul+softmax)보다 빠를 것으로 예상됩니다.
+    """
+
+    def test_prefill_performance(self):
+        """Prefill 성능: 긴 시퀀스에서 Naive vs SDPA.
+
+        Llama-3.2-3B 스펙으로 측정합니다.
+        Prefill은 compute-bound이므로 FlashAttention의 tiling이 효과적입니다.
+        """
+        num_tokens = 512
+        num_heads, num_kv_heads, head_dim = 24, 8, 128
+        dtype = DEFAULT_DTYPE
+        warmup = 10
+        repeat = 100
+
+        naive = NaiveAttention()
+        sdpa = SDPAAttention()
+
+        q = torch.randn(num_tokens, num_heads, head_dim,
+                         dtype=dtype, device=DEVICE)
+        k = torch.randn(num_tokens, num_kv_heads, head_dim,
+                         dtype=dtype, device=DEVICE)
+        v = torch.randn(num_tokens, num_kv_heads, head_dim,
+                         dtype=dtype, device=DEVICE)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        # --- Naive ---
+        for _ in range(warmup):
+            naive.forward(q, k, v, is_causal=True)
+        torch.cuda.synchronize()
+
+        start.record()
+        for _ in range(repeat):
+            naive.forward(q, k, v, is_causal=True)
+        end.record()
+        torch.cuda.synchronize()
+        naive_us = start.elapsed_time(end) / repeat * 1000
+
+        # --- SDPA ---
+        for _ in range(warmup):
+            sdpa.forward(q, k, v, is_causal=True)
+        torch.cuda.synchronize()
+
+        start.record()
+        for _ in range(repeat):
+            sdpa.forward(q, k, v, is_causal=True)
+        end.record()
+        torch.cuda.synchronize()
+        sdpa_us = start.elapsed_time(end) / repeat * 1000
+
+        print(f"\n  [Prefill] num_tokens={num_tokens}, "
+              f"heads={num_heads}, kv_heads={num_kv_heads}, "
+              f"head_dim={head_dim}, dtype={dtype}")
+        print(f"  [1] Naive (matmul + softmax + matmul):  {naive_us:.1f} us")
+        print(f"  [2] SDPA (FlashAttention/MemEfficient): {sdpa_us:.1f} us")
+        print(f"  Naive vs SDPA: {naive_us / sdpa_us:.2f}x")
+
+    def test_decode_performance(self):
+        """Decode 성능: 1토큰 query가 긴 KV cache에 attend.
+
+        Decode는 Q=[1, heads, dim]이므로 GEMV에 가깝고 memory-bound입니다.
+        KV cache 전체를 읽어야 하므로 seq_len이 길수록 메모리 대역폭이 병목입니다.
+        """
+        seq_len = 2048
+        num_heads, num_kv_heads, head_dim = 24, 8, 128
+        dtype = DEFAULT_DTYPE
+        warmup = 10
+        repeat = 100
+
+        naive = NaiveAttention()
+        sdpa = SDPAAttention()
+
+        q = torch.randn(1, num_heads, head_dim,
+                         dtype=dtype, device=DEVICE)
+        k = torch.randn(seq_len, num_kv_heads, head_dim,
+                         dtype=dtype, device=DEVICE)
+        v = torch.randn(seq_len, num_kv_heads, head_dim,
+                         dtype=dtype, device=DEVICE)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        # --- Naive ---
+        for _ in range(warmup):
+            naive.forward(q, k, v, is_causal=False)
+        torch.cuda.synchronize()
+
+        start.record()
+        for _ in range(repeat):
+            naive.forward(q, k, v, is_causal=False)
+        end.record()
+        torch.cuda.synchronize()
+        naive_us = start.elapsed_time(end) / repeat * 1000
+
+        # --- SDPA ---
+        for _ in range(warmup):
+            sdpa.forward(q, k, v, is_causal=False)
+        torch.cuda.synchronize()
+
+        start.record()
+        for _ in range(repeat):
+            sdpa.forward(q, k, v, is_causal=False)
+        end.record()
+        torch.cuda.synchronize()
+        sdpa_us = start.elapsed_time(end) / repeat * 1000
+
+        print(f"\n  [Decode] seq_len={seq_len}, "
+              f"heads={num_heads}, kv_heads={num_kv_heads}, "
+              f"head_dim={head_dim}, dtype={dtype}")
+        print(f"  [1] Naive (matmul + softmax + matmul):  {naive_us:.1f} us")
+        print(f"  [2] SDPA (FlashAttention/MemEfficient): {sdpa_us:.1f} us")
+        print(f"  Naive vs SDPA: {naive_us / sdpa_us:.2f}x")

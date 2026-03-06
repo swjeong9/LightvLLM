@@ -75,7 +75,8 @@ tests/models/    → 모델별 테스트
 - **참조 구현은 GPU에서 동일 dtype으로** 실행 (CPU bf16은 내부적으로 float32 변환되어 결과가 달라짐)
 - **허용 오차**: float32(atol=1e-5), float16(atol=1e-3), bfloat16(atol=1e-2). 리덕션 없는 element-wise 연산은 더 타이트하게 가능
 - **벤치마크**: PyTorch 최적화 옵션(inplace 등)도 포함하여 공정 비교. Non-Fused vs Fused 체계적 비교
-- **테스트 클래스**: `TestXxx` (커널 테스트), `TestXxxWrappers` (래퍼+Module 테스트)
+- **성능 비교 필수**: 동일 기능의 다른 구현이 존재하면 반드시 벤치마크로 차이를 측정한다. 예) Naive vs SDPA Attention (Prefill/Decode 각각), Fused vs Non-Fused MLP, 커스텀 CUDA 커널 vs PyTorch 내장
+- **테스트 클래스**: `TestXxx` (커널 테스트), `TestXxxWrappers` (래퍼+Module 테스트), `TestXxxBenchmark` (성능 벤치마크)
 
 ## Git 컨벤션
 
