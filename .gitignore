@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 .python-version
 .vscode/
+.pytest_cache/
+build/
+
+
+# 컴파일된 바이너리
+*.so
+*.egg-info/
+tests/bin/

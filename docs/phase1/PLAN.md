@@ -1,0 +1,275 @@
+# Phase 1: LightvLLM 기본 커널 구현 계획
+
+## 목표
+자연어 입력을 받아 LLaMA 모델로 추론하여 출력하는 기본 파이프라인 구현 (학습 목적)
+
+---
+
+## 전체 파이프라인
+
+```
+Text → Tokenizer → Embedding (PyTorch) → RoPE → Attention → MLP (SiLU+Mul) → Output
+```
+
+- **Embedding**: PyTorch `F.embedding()` 사용 (vLLM도 동일)
+- **RoPE, Attention, MLP**: CUDA 커널로 구현
+
+---
+
+## 완료된 작업
+
+### 1. GPU 메모리 최적화 매크로 — `csrc/cuda_compat.h` (182줄) ✅
+
+GPU 메모리 계층 구조(레지스터 → 공유메모리 → L1 → L2 → 글로벌)에 대한 상세 교육 문서와 함께 두 가지 핵심 매크로를 구현:
+
+- **`VLLM_LDG(arg)`**: `__ldg()` 래핑 매크로. 읽기 전용 데이터(모델 가중치, cos/sin 캐시 등)를 텍스처 캐시 경로로 로드하여 L1 캐시 오염(cache pollution)을 방지. 메모리 바운드 커널에서 5~20% 성능 향상 가능.
+- **`WARP_SIZE = 32`**: NVIDIA GPU 워프 크기 상수. 리덕션 연산, 블록 크기 설정 등에 활용.
+
+### 2. 타입 디스패치 매크로 — `csrc/dispatch_utils.h` (279줄) ✅
+
+PyTorch 텐서의 런타임 dtype과 C++ 템플릿 컴파일타임 타입 간의 브릿지 역할을 하는 매크로 구현:
+
+- **`VLLM_DISPATCH_CASE_FLOATING_TYPES`**: float32, float16, bfloat16 세 가지 타입에 대한 switch case 생성
+- **`VLLM_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)`**: 메인 디스패치 매크로. `AT_DISPATCH_SWITCH`를 래핑하여 런타임에 적절한 타입의 커널을 선택적으로 호출
+
+### 3. RoPE 순수 CUDA 헤더 — `csrc/pos_encoding_kernels.cuh` (219줄) ✅
+
+PyTorch 의존성 없이 사용 가능한 RoPE 커널 헤더. `lightvllm` 네임스페이스 내에 3개 함수/커널 구현:
+
+- **`apply_token_rotary_embedding<scalar_t, IS_NEOX>()`**: 단일 (x, y) 쌍에 2D 회전 변환 적용. GPT-NeoX(전반부/후반부 쌍) 및 GPT-J(인접 쌍) 스타일 모두 지원. `VLLM_LDG` 매크로로 cos/sin 값을 텍스처 캐시 경로로 로드.
+- **`apply_rotary_embedding<scalar_t, IS_NEOX>()`**: 하나의 토큰에 대해 모든 Query/Key head에 RoPE 적용. 블록 내 스레드들이 `threadIdx.x + blockDim.x` stride로 협력 처리. GQA 지원 (`num_kv_heads < num_heads`).
+- **`rotary_embedding_kernel<scalar_t, IS_NEOX>()`**: 메인 CUDA 커널. Grid=(num_tokens), Block=(min(num_heads*rot_dim/2, 512)) 병렬화 전략.
+
+### 4. RoPE PyTorch 연동 — `csrc/pos_encoding_kernels.cu` (209줄) ✅
+
+RoPE의 수학적 원리(2D 회전 변환, 상대 위치 인코딩 증명, Q/K에만 적용하는 이유 등)에 대한 상세 교육 문서와 함께 PyTorch 진입점 함수 구현:
+
+- **`rotary_embedding()`**: Python에서 호출되는 C++ 함수. 텐서 크기에서 num_heads, num_kv_heads, rot_dim 등을 자동 추출하고, `VLLM_DISPATCH_FLOATING_TYPES`로 dtype 디스패치 후 커널 launch. `CUDAGuard`로 멀티 GPU 지원.
+
+### 5. Low-level RoPE 테스트 — `tests/test_rope_kernel.cu` (512줄) ✅
+
+PyTorch 없이 CUDA 커널을 직접 테스트하는 C++ 테스트 스위트:
+
+- **CPU 참조 구현**: GPU 결과 비교용 `rope_cpu_reference()` 함수 (GPT-NeoX 스타일)
+- **cos/sin 캐시 생성**: `generate_cos_sin_cache()` — θ_i = pos × base^(-2i/d) 공식으로 CPU에서 캐시 생성
+- **테스트 유틸리티**: `compare_arrays()` (오차 비교), `compute_norm()` (L2 norm)
+- **테스트 케이스 3개**:
+  - Test 1 — Basic Correctness: GPU vs CPU 참조 구현 결과 비교 (1024토큰, 64헤드, 8 KV헤드, 128 head_size). CPU/GPU 실행시간 및 speedup 측정.
+  - Test 2 — Norm Preservation: RoPE 적용 전후 head 벡터의 L2 norm이 보존되는지 검증 (회전 행렬의 직교성).
+  - Test 3 — Position 0 Identity: position=0일 때 cos(0)=1, sin(0)=0이므로 입력=출력인지 검증.
+- **컴파일**: `nvcc -O2 -std=c++17 -I csrc tests/test_rope_kernel.cu -o tests/test_rope_kernel`
+
+### 6. 프로젝트 인프라 ✅
+
+- **`pyproject.toml`**: PEP 621 표준, lightvllm 0.1.0, torch>=2.8.0, pytest 설정
+- **패키지 구조**: `lightvllm/{kernels,layers,attention,models,utils}/` 스켈레톤 구성 완료
+- **`lightvllm/utils/logging.py`**: 로깅 유틸리티 완성
+
+### 7. PyTorch 바인딩 — `csrc/torch_bindings.cpp` ✅
+
+PYBIND11을 통해 CUDA 커널을 Python에서 호출 가능하게 연결:
+
+- **`rotary_embedding`** 함수 선언 및 `m.def()` 바인딩 활성화
+- Python에서 `import lightvllm._C` → `_C.rotary_embedding(...)` 호출 가능
+
+### 8. CUDA Extension 빌드 설정 — `setup.py` ✅
+
+`torch.utils.cpp_extension.CUDAExtension`을 사용한 빌드 스크립트:
+
+- **빌드**: `uv run python setup.py build_ext --inplace`
+- **결과물**: `lightvllm/_C.cpython-*.so`
+- `pyproject.toml`의 `build-system.requires`에 `torch>=2.8.0` 추가하여 빌드 환경에서도 torch 사용 가능
+
+### 9. Python RoPE 테스트 — `tests/kernels/test_rope.py` ✅
+
+CUDA 커널을 PyTorch GPU 참조 구현과 비교하는 테스트 (기본 dtype: **bf16**):
+
+- **참조 구현**: `rope_reference()` — GPU에서 동일 dtype으로 실행 (CPU bf16은 내부적으로 float32 변환하여 결과가 달라지므로 GPU 필수)
+- **cos/sin 캐시 생성**: `generate_cos_sin_cache()` — float32로 계산 후 target dtype으로 변환
+- **테스트 케이스 6개** (모두 bit-exact 일치, `atol=0, rtol=0`):
+  - Test 1 — Basic Correctness: bf16, 32토큰, 8헤드, 2 KV헤드
+  - Test 2 — Norm Preservation: 회전 전후 L2 norm 보존 확인
+  - Test 3 — Position 0 Identity: position=0에서 항등 변환 확인
+  - Test 4 — Half Dtypes: float16, bfloat16 파라미터화 테스트
+  - Test 5 — Large Scale: LLaMA-like 설정 (1024토큰, 32헤드, 8 KV헤드, 128 head_size)
+
+### 10. CUB 호환 헤더 — `csrc/cub_compat.h` (26줄) ✅
+
+CUB 2.0.8 이상에서 `cub::Sum()`이 `cuda::std::plus<>`로 변경된 호환성 문제 해결:
+
+- **`CubAddOp`**: CUB 버전에 따라 `cub::Sum()` 또는 `cuda::std::plus<void>()` 자동 선택
+
+### 11. RMSNorm 순수 CUDA 헤더 — `csrc/layernorm_kernels.cuh` (245줄) ✅
+
+PyTorch 의존성 없이 사용 가능한 RMSNorm 커널 헤더. CUB `BlockReduce`를 사용한 효율적인 병렬 리덕션:
+
+- **`rms_norm_kernel<scalar_t>()`**: Two-Pass 알고리즘. Pass 1에서 fp32로 제곱합 누적 + BlockReduce + rsqrt 계산 및 `__shared__` 브로드캐스트, Pass 2에서 정규화 적용. Grid=(num_tokens), Block=(block_size).
+- **`fused_add_rms_norm_kernel<scalar_t>()`**: 잔차 덧셈 + RMSNorm을 하나의 커널에서 수행. Pass 1에서 `residual += input`과 제곱합 누적을 동시에 처리하여 글로벌 메모리 읽기 1회 절약. 두 텐서 모두 in-place 수정.
+
+### 12. RMSNorm PyTorch 연동 — `csrc/layernorm_kernels.cu` (249줄) ✅
+
+RMSNorm의 수학적 원리(LLaMA Pre-Norm 구조, LayerNorm 비교, Fused 커널의 메모리 대역폭 분석)에 대한 상세 교육 문서와 함께 PyTorch 진입점 함수 구현:
+
+- **`rms_norm()`**: 출력 텐서에 정규화 결과 저장. 블록 크기 휴리스틱(토큰 수 < 256이면 1024, 아니면 256) 적용.
+- **`fused_add_rms_norm()`**: input과 residual을 in-place로 수정. `VLLM_DISPATCH_FLOATING_TYPES`로 dtype 디스패치.
+
+### 13. Python 래퍼 및 nn.Module ✅
+
+- **`lightvllm/kernels/layernorm.py`** (61줄): `rms_norm()`, `fused_add_rms_norm()` Python 래퍼 함수
+- **`lightvllm/layers/normalization.py`** (70줄): `RMSNorm` nn.Module 클래스. forward에서 residual 유무에 따라 `rms_norm` / `fused_add_rms_norm` 자동 분기.
+
+### 14. RMSNorm 테스트 ✅
+
+**C++ Low-level 테스트** — `tests/test_layernorm_kernel.cu`:
+- Test 1 — RMSNorm 기본 정확성 (CPU 참조 vs GPU)
+- Test 2 — Fused Add+RMSNorm 정확성 (CPU 참조 재사용)
+- Test 3 — 영벡터 입력 안정성 (NaN/Inf 없음)
+- Test 4 — Fused vs Non-Fused 성능 비교 (1.56x 속도 향상)
+
+**Python 통합 테스트** — `tests/kernels/test_layernorm.py` (16개 테스트):
+- 기본 정확성 (bf16), Fused 커널 정확성, residual bit-exact 검증
+- 단위 가중치 수학적 성질, 영벡터 안정성
+- half dtype별 (fp16, bf16) 검증, 대규모 텐서 (1024×4096)
+- 다양한 hidden_size (128~8192) 파라미터화
+- HuggingFace `LlamaRMSNorm`과의 정확성 비교
+- 성능 벤치마크: HuggingFace vs PyTorch 참조 vs CUDA 커널 vs Non-Fused vs Fused
+
+### 15. Activation 순수 CUDA 헤더 — `csrc/activation_kernels.cuh` (412줄) ✅
+
+128-bit 벡터화를 도입한 SiLU 활성화 커널 헤더:
+
+- **`silu_kernel<T>()`**: SiLU 활성화 함수. `__device__ __forceinline__`, fp32 중간 연산으로 수치 안정성 확보.
+- **`activation_kernel<scalar_t, ACT_FN>()`**: element-wise 활성화 커널. 128-bit `int4` 벡터화 + 정렬 체크 + scalar fallback 이중 경로.
+- **`act_and_mul_kernel<scalar_t, ACT_FN>()`**: Fused silu_and_mul 커널. 입력 `[..., 2*d]` → 출력 `[..., d]`. `silu(gate)` 결과를 레지스터에 유지한 채 up과 곱셈.
+
+### 16. Activation PyTorch 연동 — `csrc/activation_kernels.cu` (517줄) ✅
+
+활성화 함수 발전사(ReLU→GELU→SiLU), SwiGLU 구조, 메모리 대역폭 분석에 대한 상세 교육 문서와 함께 PyTorch 진입점 구현:
+
+- **`silu()`**: element-wise SiLU 적용. `VLLM_DISPATCH_FLOATING_TYPES`, `CUDAGuard` 사용.
+- **`silu_and_mul()`**: Fused gate 연산. 입력의 전반부에 SiLU 적용 후 후반부와 곱셈.
+
+### 17. Activation Python 래퍼 및 nn.Module ✅
+
+- **`lightvllm/kernels/activation.py`** (47줄): `silu()`, `silu_and_mul()` Python 래퍼 함수
+- **`lightvllm/layers/activation.py`** (33줄): `SiluAndMul` nn.Module 클래스 (학습 파라미터 없음)
+
+### 18. RoPE Python 래퍼 완성 ✅
+
+기존 빈 스텁을 완전 구현:
+
+- **`lightvllm/kernels/pos_encoding.py`** (34줄): `rotary_embedding()` Python 래퍼 함수
+- **`lightvllm/layers/rotary_embedding.py`** (92줄): `RotaryEmbedding` nn.Module (cos/sin 캐시 생성 + forward)
+
+### 19. Activation 테스트 ✅
+
+**C++ Low-level 테스트** — `tests/test_activation_kernel.cu` (531줄):
+- Test 1 — SiLU 기본 정확성 (GPU vs CPU 참조)
+- Test 2 — silu_and_mul 기본 정확성
+- Test 3 — SiLU 수학적 성질 (silu(0)=0, 하한값 ≈ -0.278)
+- Test 4 — 수치 안정성 (극단값에서 NaN/Inf 없음)
+- Test 5 — Non-Fused vs Fused 성능 벤치마크 (1.49x 속도 향상)
+
+**Python 통합 테스트** — `tests/kernels/test_activation.py` (31개 테스트):
+- SiLU: 기본 정확성, zero, dtype별, 큰 값, 다양한 크기, PyTorch Module 비교, 성능 벤치마크
+- silu_and_mul: 기본 정확성, shape 검증, dtype별, 대규모, 3D 입력, zero gate, unit up, 성능 벤치마크
+- 래퍼: silu/silu_and_mul 래퍼, 3D 래퍼, SiluAndMul Module
+
+### 20. 전 커널 Python 래퍼 테스트 추가 ✅
+
+기존 테스트 파일에 래퍼 계층 검증 테스트 추가 (13개):
+
+- `tests/kernels/test_activation.py`: `TestActivationWrappers` (5개)
+- `tests/kernels/test_layernorm.py`: `TestLayerNormWrappers` (4개)
+- `tests/kernels/test_rope.py`: `TestRoPEWrappers` (4개)
+
+### 21. Linear 레이어 — `lightvllm/layers/linear.py` (128줄) ✅
+
+LLaMA 모델의 모든 프로젝션(QKV, Output, Gate, Up, Down)의 기본 빌딩블록:
+
+- **`Linear`**: `F.linear` + 직접 weight/bias `nn.Parameter` 관리. `torch.nn.Linear` 대신 사용하여 weight 로딩 방식을 통일. LLaMA는 bias=False 기본.
+- **`MergedLinear`**: 여러 별도 프로젝션을 하나의 큰 weight 행렬로 융합하여 GEMM 1회로 처리.
+  - `output_sizes` 리스트로 각 shard 크기 정의 (예: gate_up_proj=[intermediate, intermediate], qkv_proj=[q_size, kv_size, kv_size])
+  - **`weight_loader(param, loaded_weight, shard_id)`**: HuggingFace 체크포인트의 별도 가중치(q_proj, k_proj, v_proj 등)를 융합 파라미터의 올바른 오프셋에 로딩
+  - shard_id: int(0=gate, 1=up) 또는 str("q", "k", "v")
+- **왜 Fuse하는가**: 2~3번의 별도 CUDA 커널 launch → 1번의 큰 GEMM. GPU utilization 향상, 커널 launch 오버헤드 제거
+
+**Python 통합 테스트** — `tests/layers/test_linear.py` (20개 테스트):
+- Linear: 기본 forward, 다양한 shape, bias 유무, dtype별, weight shape, 3D 입력
+- MergedLinear: gate_up 2 shard, qkv 3 shard, output shape, weight_loader 정확성(gate_up/qkv), dtype, offsets, bias
+
+### 22. LlamaAttention — `lightvllm/models/llama.py` (742줄 중 115~277) ✅
+
+GQA + RoPE + KV Cache를 통합한 Multi-Head Attention:
+
+- **`LlamaAttention`**: MergedLinear QKV 융합(1 GEMM) + RoPE(in-place) + SDPA + KV Cache
+  - 10단계 forward: qkv_proj → split → contiguous → RoPE → reshape 3D → cache update → is_causal → SDPA → reshape 2D → o_proj
+  - `is_causal = (num_tokens > 1)`: prefill=True, decode=False
+  - `.contiguous()` 필수: split 후 CUDA 커널에 전달하기 위해
+
+**Python 통합 테스트** — `tests/models/test_llama.py` (8개 테스트):
+- output_shape, gqa, rope_applied, prefill_with_kv_cache, decode_with_kv_cache, prefill_decode_consistency, weight_loading_qkv, dtype_bf16
+
+### 23. LlamaDecoderLayer — `lightvllm/models/llama.py` (279~441) ✅
+
+Pre-Norm Residual 패턴의 Transformer Decoder Layer:
+
+- **`LlamaDecoderLayer`**: LlamaAttention + LlamaMLP + RMSNorm × 2
+  - 첫 번째 layer: residual=None → plain RMSNorm
+  - 이후 layer: fused_add_rms_norm (덧셈+정규화 1회 커널 호출)
+  - residual을 layer 간 명시적 전달 (gradient highway)
+
+**Python 통합 테스트** — (5개 테스트):
+- output_shape_and_residual, first_layer_residual_none, subsequent_layer_fused_norm, with_kv_cache, dtype
+
+### 24. LlamaModel — `lightvllm/models/llama.py` (444~562) ✅
+
+Embedding + DecoderLayer 스택 + 최종 RMSNorm:
+
+- **`LlamaModel`**: embed_tokens → layers × N → final norm
+  - kv_cache.advance()는 모든 layer 후 1회만 호출
+  - 최종 norm에서 마지막 MLP 출력을 residual에 합산 + 정규화
+
+**Python 통합 테스트** — (3개 테스트):
+- forward_shape, multi_layer, with_kv_cache
+
+### 25. LlamaForCausalLM + from_pretrained — `lightvllm/models/llama.py` (565~742) ✅
+
+LM Head + HuggingFace 체크포인트 로딩:
+
+- **`LlamaForCausalLM`**: LlamaModel + lm_head(Linear), logits.float()
+- **`from_pretrained()`**: config.json 파싱 + stacked_params_mapping으로 가중치 융합 로딩
+  - QKV: q_proj + k_proj + v_proj → qkv_proj (shard_id="q"/"k"/"v")
+  - MLP: gate_proj + up_proj → gate_up_proj (shard_id=SHARD_GATE/SHARD_UP)
+  - tie_word_embeddings: lm_head.weight = embed_tokens.weight
+
+**Python 통합 테스트** — (3개 테스트):
+- logits_shape, logits_fp32, greedy_generate
+
+### 26. HuggingFace 검증 — LLaMA-3.2-3B-Instruct ✅
+
+실제 HuggingFace 모델과 출력 비교:
+
+- **`TestLlamaHFValidation`**: from_pretrained 로딩 → forward 비교 → argmax 예측 일치 확인
+  - 입력: "The capital of France is"
+  - 양쪽 모두 " Paris" (token 12366) 예측
+  - max abs diff ~0.125, mean abs diff ~0.001 (bf16 28-layer 정상)
+
+---
+
+## Phase 1 완료
+
+Phase 1의 전체 파이프라인이 완성되었다:
+CUDA 커널(RoPE, RMSNorm, SiLU) → Python 래퍼 → nn.Module 레이어 →
+LLaMA 모델(MLP, Attention, DecoderLayer, Model, CausalLM) → HF 검증.
+
+전체 테스트: C++ 12개 + Python 커널 63개 + Linear 20개 + Attention 22개 + 모델 28개 = **145개 통과**.
+
+---
+
+## 참조
+
+- vLLM 원본: `/home/ubuntu/LightvLLM/vLLM/csrc/`
+- vLLM 레이어 참조: `vLLM/vllm/model_executor/layers/linear.py`
+- vLLM 모델 참조: `vLLM/vllm/model_executor/models/llama.py`
+- 학습 로드맵: `/home/ubuntu/LightvLLM/docs/LEARNING_ROADMAP.md`
